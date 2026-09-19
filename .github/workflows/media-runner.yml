@@ -1,21 +1,15 @@
 name: media-runner
 
-# An extra media worker for the box. It holds no code of its own: the engines
-# are fetched from the broker at start-up, so this public repo never contains
-# anything but this file.
-#
-# Sessions die without warning (GitHub's own cause: "the hosted runner lost
-# communication with the server"). Nothing here tries to prevent that — an
-# unfinished job simply stops beating and the box runs it locally instead.
-
 on:
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Minutes to stay up (GitHub kills any job at 360)'
+        required: false
+        default: '330'
 
-# At most one session at a time, with one queued behind it. The queued run
-# starts the moment the live one dies, which is the restart mechanism — no
-# self-dispatch token needed.
 concurrency:
   group: media-runner
   cancel-in-progress: false
@@ -56,8 +50,11 @@ jobs:
         env:
           GH_BROKER: ${{ secrets.KW_BROKER_URL }}
           GH_TOKEN: ${{ secrets.KW_MEDIA_TOKEN }}
-          GH_SLOTS: '2'
+          GH_SLOTS: '1'
+          GH_MINUTES: ${{ github.event.inputs.minutes || '330' }}
         run: |
           cd ~/vps/gh_media
           chmod +x run.sh
-          ./run.sh
+          echo "staying up for ${GH_MINUTES} minutes"
+          timeout --signal=INT "${GH_MINUTES}m" ./run.sh || true
+          echo "session over"
