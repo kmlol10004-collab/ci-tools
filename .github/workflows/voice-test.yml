@@ -1,0 +1,59 @@
+name: voice-test
+on:
+  workflow_dispatch:
+    inputs:
+      text: {required: true}
+      text2: {required: false, default: ''}
+      lang: {required: false, default: 'ar'}
+      src_b64: {required: false, default: ''}
+permissions: {contents: read}
+jobs:
+  tts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      T1: ${{ inputs.text }}
+      T2: ${{ inputs.text2 }}
+      LG: ${{ inputs.lang }}
+      SB: ${{ inputs.src_b64 }}
+    steps:
+    - run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+        df -h / | tail -1; nproc; free -m | head -2
+        sudo apt-get update -qq; sudo apt-get install -y -qq ffmpeg jq >/dev/null
+        t0=$(date +%s); docker pull -q ghcr.io/debpalash/voicestudio:latest
+        echo "pull_sec=$(( $(date +%s) - t0 ))" | tee -a r.txt
+        docker image inspect ghcr.io/debpalash/voicestudio:latest --format 'image_bytes={{.Size}}' | tee -a r.txt
+    - run: |
+        K=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))'); echo "::add-mask::$K"; echo "K=$K" >> $GITHUB_ENV
+        mkdir -p ~/hf
+        docker run -d --name ov -p 127.0.0.1:3900:3900 -e OMNIVOICE_API_KEY=$K -e OMNIVOICE_SERVER_MODE=1 -e OMNIVOICE_CPU_GENERATE_TIMEOUT_S=3600 -e OMNIVOICE_GENERATE_TIMEOUT_S=3600 -v ~/hf:/root/.cache/huggingface ghcr.io/debpalash/voicestudio:latest
+        t0=$(date +%s); for i in $(seq 120); do c=$(curl -s -o h.json -w '%{http_code}' -H "Authorization: Bearer $K" localhost:3900/health || true); [ "$c" = 200 ] && break; sleep 5; done
+        echo "health=$c health_sec=$(( $(date +%s) - t0 ))" | tee -a r.txt; cat h.json; echo
+        [ "$c" = 200 ] || { docker logs ov | tail -80; exit 1; }
+        curl -s -H "Authorization: Bearer $K" localhost:3900/engines/tts | cut -c1-1500; echo
+    - if: env.SB != ''
+      run: |
+        U=$(echo "$SB" | base64 -d); echo "::add-mask::$U"
+        curl -sSf -m 300 -A kw-voice-test "$U" -o reel.mp4; ls -la reel.mp4
+    - run: |
+        (while :; do docker stats --no-stream --format '{{.MemUsage}} {{.CPUPerc}}' ov >> st.log; sleep 5; done) & echo $! > st.pid
+        say(){ jq -n --arg t "$1" --arg l "$LG" '{model:"omnivoice",input:$t,voice:"default",response_format:"wav",language:$l}' > q.json
+          t0=$(date +%s); c=$(curl -s -o $2 -w '%{http_code}' -m 3600 -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d @q.json localhost:3900/v1/audio/speech || true)
+          echo "$2 code=$c sec=$(( $(date +%s) - t0 ))" | tee -a r.txt
+          [ "$c" = 200 ] || { head -c 1500 $2; echo; docker logs ov 2>&1 | tail -100; return 1; }
+          ffprobe -v error -show_entries format=duration -of csv=p=0 $2 | sed "s/^/$2 dur=/" | tee -a r.txt; }
+        say "$T1" v1.wav
+        [ -n "$T2" ] && say "$T2" v2.wav || true
+    - if: env.SB != ''
+      run: |
+        [ -f v2.wav ] && ffmpeg -v error -i v1.wav -i v2.wav -filter_complex '[0:a][1:a]concat=n=2:v=0:a=1' v.wav || cp v1.wav v.wav
+        ffmpeg -v error -y -i reel.mp4 -i v.wav -filter_complex '[0:a]volume=0.25[b];[1:a]adelay=500|500[o];[b][o]amix=inputs=2:duration=first,loudnorm=I=-14:TP=-1.5[a]' -map 0:v -map '[a]' -c:v copy -c:a aac -b:a 160k -movflags +faststart reel_voiced.mp4
+        ls -la reel_voiced.mp4
+    - if: always()
+      run: |
+        kill $(cat st.pid) || true; sort -h st.log | tail -3 | tee -a r.txt; docker logs ov > backend.log 2>&1 || true
+        du -sh ~/hf | sed 's/^/hf=/' | tee -a r.txt; cat r.txt
+    - if: always()
+      uses: actions/upload-artifact@v4
+      with: {name: voice-test, if-no-files-found: warn, path: "v1.wav\nv2.wav\nv.wav\nreel_voiced.mp4\nr.txt\nbackend.log\nst.log"}
