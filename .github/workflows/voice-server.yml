@@ -1,0 +1,47 @@
+name: voice-server
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7 */6 * * *'
+concurrency: {group: voice-server, cancel-in-progress: false}
+permissions: {contents: read}
+jobs:
+  tts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      BROKER: ${{ secrets.KW_BROKER_URL }}
+      TOKEN: ${{ secrets.KW_MEDIA_TOKEN }}
+    steps:
+    - name: start OmniVoice
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+        sudo apt-get install -y -qq jq >/dev/null 2>&1 || true
+        docker pull -q ghcr.io/debpalash/voicestudio:latest
+        K=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))'); echo "::add-mask::$K"; echo "K=$K" >> $GITHUB_ENV
+        mkdir -p ~/hf
+        docker run -d --name ov -p 127.0.0.1:3900:3900 -e OMNIVOICE_API_KEY=$K -e OMNIVOICE_SERVER_MODE=1 -e OMNIVOICE_CPU_GENERATE_TIMEOUT_S=3600 -e OMNIVOICE_GENERATE_TIMEOUT_S=3600 -v ~/hf:/root/.cache/huggingface ghcr.io/debpalash/voicestudio:latest
+        for i in $(seq 120); do c=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $K" localhost:3900/health || true); [ "$c" = 200 ] && break; sleep 5; done
+        [ "$c" = 200 ] || { docker logs ov | tail -60; exit 1; }
+        jq -n '{model:"omnivoice",input:"أهلاً بكم في كواملي ميديا",voice:"default",response_format:"wav",language:"Egyptian Arabic"}' > w.json
+        t0=$(date +%s); curl -s -o /dev/null -m 1800 -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d @w.json localhost:3900/v1/audio/speech
+        echo "warm-up done in $(( $(date +%s) - t0 ))s"
+    - name: serve voice jobs
+      run: |
+        B="${BROKER%/gh_broker.php}/kw_tts_broker.php"
+        UA='kwamle-media-agent/1.0'; NAME="gh-voice-$(hostname | cut -c1-12)"
+        end=$(( $(date +%s) + 335*60 )); n=0
+        while [ $(date +%s) -lt $end ]; do
+          j=$(curl -s -m 15 -A "$UA" -H "X-GH-Token: $TOKEN" -X POST "$B?op=next" -d "name=$NAME" || echo '{}')
+          id=$(echo "$j" | jq -r '.job.id // empty' 2>/dev/null)
+          if [ -n "$id" ]; then
+            echo "$j" | jq '{model:"omnivoice",input:.job.text,voice:"default",response_format:"wav",language:(.job.lang // "Egyptian Arabic")}' > q.json
+            t0=$(date +%s); c=$(curl -s -o out.wav -w '%{http_code}' -m 900 -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d @q.json localhost:3900/v1/audio/speech || true)
+            echo "job $id code=$c sec=$(( $(date +%s) - t0 ))"
+            if [ "$c" = 200 ]; then curl -s -m 120 -A "$UA" -H "X-GH-Token: $TOKEN" -F "id=$id" -F "wav=@out.wav" "$B?op=done"; else curl -s -m 15 -A "$UA" -H "X-GH-Token: $TOKEN" -X POST "$B?op=fail" -d "id=$id&reason=http_$c"; fi
+            echo; n=$((n+1))
+          else
+            sleep 3
+          fi
+        done
+        echo "session over, jobs served: $n"
