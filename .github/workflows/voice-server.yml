@@ -12,36 +12,39 @@ jobs:
     env:
       BROKER: ${{ secrets.KW_BROKER_URL }}
       TOKEN: ${{ secrets.KW_MEDIA_TOKEN }}
+      MAX_RATIO: '8'
     steps:
-    - name: start OmniVoice
+    - name: start two OmniVoice engines
       run: |
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-        sudo apt-get install -y -qq jq >/dev/null 2>&1 || true
+        sudo apt-get install -y -qq jq ffmpeg >/dev/null 2>&1 || true
         docker pull -q ghcr.io/debpalash/voicestudio:latest
         K=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))'); echo "::add-mask::$K"; echo "K=$K" >> $GITHUB_ENV
         mkdir -p ~/hf
-        docker run -d --name ov -p 127.0.0.1:3900:3900 -e OMNIVOICE_API_KEY=$K -e OMNIVOICE_SERVER_MODE=1 -e OMNIVOICE_CPU_GENERATE_TIMEOUT_S=3600 -e OMNIVOICE_GENERATE_TIMEOUT_S=3600 -v ~/hf:/root/.cache/huggingface ghcr.io/debpalash/voicestudio:latest
-        for i in $(seq 120); do c=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $K" localhost:3900/health || true); [ "$c" = 200 ] && break; sleep 5; done
-        [ "$c" = 200 ] || { docker logs ov | tail -60; exit 1; }
-        jq -n '{model:"omnivoice",input:"أهلاً بكم في كواملي ميديا",voice:"default",response_format:"wav",language:"Egyptian Arabic"}' > w.json
-        t0=$(date +%s); curl -s -o /dev/null -m 1800 -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d @w.json localhost:3900/v1/audio/speech
-        echo "warm-up done in $(( $(date +%s) - t0 ))s"
-    - name: serve voice jobs
+        for p in 3900 3901; do docker run -d --name ov$p -p 127.0.0.1:$p:3900 -e OMNIVOICE_API_KEY=$K -e OMNIVOICE_SERVER_MODE=1 -e OMNIVOICE_CPU_GENERATE_TIMEOUT_S=3600 -e OMNIVOICE_GENERATE_TIMEOUT_S=3600 -v ~/hf:/root/.cache/huggingface ghcr.io/debpalash/voicestudio:latest; done
+        for p in 3900 3901; do for i in $(seq 120); do c=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $K" localhost:$p/health || true); [ "$c" = 200 ] && break; sleep 5; done; [ "$c" = 200 ] || { docker logs ov$p | tail -40; exit 1; }; done
+    - name: warm up and benchmark (a slow machine quits so the next dispatch gets another)
       run: |
-        B="${BROKER%/gh_broker.php}/kw_tts_broker.php"
-        UA='kwamle-media-agent/1.0'; NAME="gh-voice-$(hostname | cut -c1-12)"
-        end=$(( $(date +%s) + 335*60 )); n=0
-        while [ $(date +%s) -lt $end ]; do
-          j=$(curl -s -m 15 -A "$UA" -H "X-GH-Token: $TOKEN" -X POST "$B?op=next" -d "name=$NAME" || echo '{}')
-          id=$(echo "$j" | jq -r '.job.id // empty' 2>/dev/null)
-          if [ -n "$id" ]; then
-            echo "$j" | jq '{model:"omnivoice",input:.job.text,voice:"default",response_format:"wav",language:(.job.lang // "Egyptian Arabic")}' > q.json
-            t0=$(date +%s); c=$(curl -s -o out.wav -w '%{http_code}' -m 900 -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d @q.json localhost:3900/v1/audio/speech || true)
-            echo "job $id code=$c sec=$(( $(date +%s) - t0 ))"
-            if [ "$c" = 200 ]; then curl -s -m 120 -A "$UA" -H "X-GH-Token: $TOKEN" -F "id=$id" -F "wav=@out.wav" "$B?op=done"; else curl -s -m 15 -A "$UA" -H "X-GH-Token: $TOKEN" -X POST "$B?op=fail" -d "id=$id&reason=http_$c"; fi
-            echo; n=$((n+1))
-          else
-            sleep 3
-          fi
-        done
-        echo "session over, jobs served: $n"
+        jq -n '{model:"omnivoice",input:"أهلاً بكم في كواملي ميديا، كيف يمكنني مساعدتكم اليوم؟",voice:"default",response_format:"wav",language:"Egyptian Arabic"}' > w.json
+        curl -s -o /dev/null -m 1800 -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d @w.json localhost:3900/v1/audio/speech
+        t0=$(date +%s); curl -s -o b.wav -m 1800 -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d @w.json localhost:3900/v1/audio/speech; el=$(( $(date +%s) - t0 ))
+        dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 b.wav 2>/dev/null | cut -d. -f1); [ -z "$dur" ] && dur=1; [ "$dur" -lt 1 ] && dur=1
+        ratio=$(( el / dur )); echo "benchmark: ${el}s for ${dur}s of speech = ${ratio}x realtime (limit $MAX_RATIO)"
+        curl -s -o /dev/null -m 1800 -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d @w.json localhost:3901/v1/audio/speech
+        if [ "$ratio" -gt "$MAX_RATIO" ]; then echo "too slow, giving this machine back"; exit 1; fi
+    - name: serve voice jobs (two engines in parallel)
+      run: |
+        B="${BROKER%/gh_broker.php}/kw_tts_broker.php"; UA='kwamle-media-agent/1.0'
+        serve() { local p=$1 NAME="gh-voice-$(hostname | cut -c1-10)-$1" end=$(( $(date +%s) + 330*60 )) n=0
+          while [ $(date +%s) -lt $end ]; do
+            j=$(curl -s -m 15 -A "$UA" -H "X-GH-Token: $TOKEN" -X POST "$B?op=next" -d "name=$NAME" || echo '{}')
+            id=$(echo "$j" | jq -r '.job.id // empty' 2>/dev/null)
+            if [ -n "$id" ]; then
+              echo "$j" | jq '{model:"omnivoice",input:.job.text,voice:"default",response_format:"wav",language:(.job.lang // "Egyptian Arabic")}' > q$p.json
+              t0=$(date +%s); c=$(curl -s -o out$p.wav -w '%{http_code}' -m 900 -H "Authorization: Bearer $K" -H 'Content-Type: application/json' -d @q$p.json localhost:$p/v1/audio/speech || true)
+              echo "[$p] job $id code=$c sec=$(( $(date +%s) - t0 ))"
+              if [ "$c" = 200 ]; then curl -s -m 120 -A "$UA" -H "X-GH-Token: $TOKEN" -F "id=$id" -F "wav=@out$p.wav" "$B?op=done"; else curl -s -m 15 -A "$UA" -H "X-GH-Token: $TOKEN" -X POST "$B?op=fail" -d "id=$id&reason=http_$c"; fi
+              echo; n=$((n+1))
+            else sleep 2; fi
+          done; echo "[$p] session over, jobs served: $n"; }
+        serve 3900 & serve 3901 & wait
